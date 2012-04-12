@@ -1,0 +1,38 @@
+#!/bin/sh
+
+# Mount a remote directory ('share') from a Samba server ('host')
+# using ('user') and ('pass') to authenticate
+# onto a destination directory ('mountpoint').
+
+### ATTENTION
+# This handler assumes that smbclient and smbfs packages are installed on the system
+
+getconf share
+getconf host
+getconf user guest
+getconf pass
+getconf domain
+getconf mountpoint
+
+auth="${user:-}${pass:+%$pass}"
+
+if [ ! -d "$mountpoint" ]; then
+	halt "Destination directory does not exist"
+fi
+
+if mountpoint -q $mountpoint; then
+        halt $mountpoint 'already mounted.  Please make sure no process is using it then manually unmount it before proceeding.'
+fi
+
+if [ ! -n "`smbclient -N -U \"$auth\" -L \"$host\" | awk '{print $1}' | grep -xi \"$share\"`" ]; then
+	halt "Unable to connect to host '$host' or source share '$share' doesn't exist"
+fi
+
+options="username=\"$user\",password=\"$pass\"${domain:+,domain=\"$domain\"}"
+
+mount -t cifs "//$host/$share" "$mountpoint" -o "$options" || halt "Mount failed"
+
+if [ `find $mountpoint -maxdepth 1 -type d | wc -l` -lt 2 ]; then
+	halt "Mount succeeded, but $mountpoint is empty! Stopping backupninja"
+fi
+

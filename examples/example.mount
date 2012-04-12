@@ -1,0 +1,4 @@
+host = 192.168.0.1
+share = data
+mountpoint = /var/backups/mount/data
+

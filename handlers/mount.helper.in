@@ -1,0 +1,45 @@
+# -*- mode: sh; sh-basic-offset: 3; indent-tabs-mode: nil; -*-
+# vim: set filetype=sh sw=3 sts=3 expandtab autoindent:
+
+HELPERS="$HELPERS mount:mount_handler"
+
+mount_wizard() {
+   mount_title="Mount action wizard"
+
+   inputBox "$mount_title" "Address of remote host" ""
+   [ $? = 1 ] && return
+   mount_host="host = $REPLY"
+   host="$REPLY"
+
+   inputBox "$mount_title" "Name of remote share" ""
+   [ $? = 1 ] && return
+   mount_share="share = $REPLY"
+   share="$REPLY"
+
+   inputBox "$mount_title" "Directory where to mount the share" "/var/backups/mount/$share"
+   [ $? = 1 ] && return
+   mount_mountpoint="mountpoint = $REPLY"
+   mountpoint=$REPLY
+   if [ ! -d "$mountpoint" ]; then
+      mkdir -p $mountpoint
+   fi
+
+
+# Save the config
+   get_next_filename $configdirectory/10_$host-$share.mount
+   cat > $next_filename <<EOF
+$mount_host
+$mount_share
+$mount_mountpoint
+
+EOF
+   chmod 600 $next_filename
+
+   get_next_filename $configdirectory/90_$host-$share.umount
+   cat > $next_filename <<EOF
+$mount_mountpoint
+
+EOF
+   chmod 600 $next_filename
+}
+
