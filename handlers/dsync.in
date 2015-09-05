@@ -3,28 +3,12 @@
 
 ###############################################################
 #
-#  This handler slowly creates a backup of each user's maildir
-#  to a remote server. It is designed to be run with low overhead
-#  in terms of cpu and bandwidth so it runs pretty slow.
-#  Hardlinking is used to save storage space.
+#  This handler uses dovecot (version 2 or later) dsync backup
+#  to backup mail to a remote server.
 #
-#  This handler expects that your maildir directory structure is
-#  either one of the following:
-#
-#  1. /$srcdir/[a-zA-Z0-9]/$user for example:
-#  /var/maildir/a/anarchist
-#  /var/maildir/a/arthur
-#  ...
-#  /var/maildir/Z/Zaphod
-#  /var/maildir/Z/Zebra
-#
-#  2. or the following:
-#  /var/maildir/domain.org/user1
-#  /var/maildir/domain.org/user2
-#  ...
-#  /var/maildir/anotherdomain.org/user1
-#  /var/maildir/anotherdomain.org/user2
-#  ...
+#  Source and destination directories are typically configured
+#  via the dovecot configuration, but can be overridden using
+#  the settings here.
 #
 #  if the configuration is setup to have keepdaily at 3,
 #  keepweekly is 2, and keepmonthly is 1, then each user's
@@ -36,20 +20,26 @@
 #    weekly.2
 #    monthly.1
 #
-#  The basic algorithm is to rsync each maildir individually,
+#  The basic algorithm is to dsync each user individually,
 #  and to use hard links for retaining historical data.
-#
-#  We handle each maildir individually because it becomes very
-#  unweldy to hardlink and rsync many hundreds of thousands
-#  of files at once. It is much faster to take on smaller
-#  chunks at a time.
 #
 #  For the backup rotation to work, destuser must be able to run
 #  arbitrary bash commands on the desthost.
 #
-#  Any maildir which is deleted from the source will be moved to
-#  "deleted" directory in the destination. It is up to you to
-#  periodically remove this directory or old maildirs in it.
+#  If 'remove' is set to 'yes' (default), then any mail directory 
+#  which is deleted from the source will be moved to a "deleted"
+#  directory in the destination. It is up to you to periodically 
+#  remove this directory or old maildirs in it.
+#
+#  Limitations:
+#    . because we are not dynamically looking up anything with
+#      dovecot's userdb, we expect all data to be under the same 
+#      tree on both the source and destination
+#    
+#    . we are assuming a backup to a backup server, so the 
+#      destination host should have its dovecot mail_location 
+#      configured to put the mail into
+#      $stripped_destdir/$letter/$user/$current_backup
 #
 ##############################################################
 
@@ -57,33 +47,41 @@ getconf rotate yes
 getconf remove yes
 getconf backup yes
 
-getconf speedlimit 0
 getconf keepdaily 5
 getconf keepweekly 3
 getconf keepmonthly 1
 
-getconf srcdir /var/maildir
+getconf srcconffile
+getconf destconffile
+getconf srcdir 
 getconf destdir
+getconf current_backup current_backup
 getconf desthost
 getconf destport 22
 getconf destuser
 getconf destid_file /root/.ssh/id_rsa
 getconf sshoptions
 
-getconf multiconnection notset
-
 failedcount=0
+
+# strip leading mailbox specifier (eg. mdbox:; maildir:, etc)
+stripped_destdir=${destdir/*:/}
+stripped_srcdir=${srcdir/*:/}
+
 # strip trailing /
 destdir=${destdir%/}
 srcdir=${srcdir%/}
 
-[ -d $srcdir ] || fatal "source directory $srcdir doesn't exist"
-
-[ "$multiconnection" == "notset" ] && fatal "The maildir handler uses a very different destination format. See the example .maildir for more information"
-
-if [ $test ]; then
-   testflags="--dry-run -v"
+if [ -n "$srcconffile" ]; then
+   srcconffile="-c $srcconffile"
 fi
+
+if [ -n "$destconffile" ]; then
+   destconffile="-c $destconffile"
+fi
+
+[ -d $stripped_srcdir ] || fatal "source directory $srcdir doesn't exist"
+
 
 ##################################################################
 ### FUNCTIONS
@@ -91,31 +89,38 @@ fi
 function do_user() {
    local user=$1
    local btype=$2
-   local userdir=${3%/}
-   local source="$srcdir/$userdir/$user/"
-   local target="$destdir/$userdir/$user/$btype.1"
-   if [ ! -d $source ]; then
-      warning "maildir $source not found"
-      return
-   fi
+   local letter=${user:0:1} 
+   local target="$stripped_destdir/$letter/$user/$btype.1"
+   local failedcount=0
+   local ret=0
 
    debug "syncing"
-   ret=`$RSYNC -e "ssh -p $destport -i $destid_file $sshoptions" -r \
-      --links --ignore-existing --delete --size-only --bwlimit=$speedlimit \
-      --exclude '.Trash/*' --exclude '.Mistakes/*' --exclude '.Spam/*' \
-      $source $destuser@$desthost:$target \
-      2>&1`
-   ret=$?
-   # ignore 0 (success) and 24 (file vanished before it could be copied)
-   if [ $ret != 0 -a $ret != 24 ]; then
-      warning "rsync $user failed"
-      warning "  returned: $ret"
-      let "failedcount = failedcount + 1"
-      if [ $failedcount -gt 100 ]; then
-         fatal "100 rsync errors -- something is not working right. bailing out."
+   while [ $failedcount -lt 3 ]; do
+      debug $DSYNC $testflags -u $user backup $srcconffile \
+         ssh -i $destid_file $destuser@$desthost $DSYNC $destconffile \
+         -u $user 2>&1
+      ret=`$DSYNC $testflags -u $user backup $srcconffile \
+         ssh -i $destid_file $destuser@$desthost $DSYNC $destconffile \
+         -u $user 2>&1`
+      ret=$?
+      if [ $ret == 2 ]; then
+         # dsync needs to be run again
+         let "failedcount = failedcount + 1"
+      elif [ $ret == 0 ]; then
+         # things worked, so we break out of the loop
+         break
+         ssh -o PasswordAuthentication=no $desthost -l $destuser -i $destid_file $sshoptions "date +%c%n%s > $stripped_destdir/$letter/$user/$btype.1/created"
+      elif [ $ret != 0 ]; then
+         # things did not work in a good way, report it and try again
+         warning "dsync $user failed"
+         warning "  returned: $ret"
+         let "failedcount = failedcount + 1"
       fi
-   fi
-   ssh -o PasswordAuthentication=no $desthost -l $destuser -i $destid_file $sshoptions "date +%c%n%s > $target/created"
+
+      if [ $failedcount -ge 3 ]; then
+         warning "dsync failed 3 times for this user -- something is not working right. bailing out."
+      fi
+   done
 }
 
 # remove any maildirs from backup which might have been deleted
@@ -123,19 +128,19 @@ function do_user() {
 # (actually, it just moved them to the directory "deleted")
 
 function do_remove() {
-   local tmp1=`maketemp maildir-tmp-file`
-   local tmp2=`maketemp maildir-tmp-file`
+   local tmp1=`maketemp dsync-tmp-file`
+   local tmp2=`maketemp dsync-tmp-file`
 
-   ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost mkdir -p "$destdir/deleted"
-      cd "$srcdir"
+   ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost mkdir -p "${stripped_destdir}/deleted"
+      cd "$stripped_srcdir"
       for userdir in `ls -d1 */`; do
-         ls -1 "$srcdir/$userdir" | sort > $tmp1
-         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost ls -1 "$destdir/$userdir" | sort > $tmp2
+         ls -1 "$stripped_srcdir/$userdir" | sort > $tmp1
+         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost ls -1 "$stripped_destdir/$userdir" | sort > $tmp2
       for deluser in `join -v 2 $tmp1 $tmp2`; do
          [ "$deluser" != "" ] || continue
-         info "removing $destuser@$desthost:$destdir/$userdir$deluser/"
-         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost mv "$destdir/$userdir$deluser/" "$destdir/deleted"
-         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost "date +%c%n%s > '$destdir/deleted/$deluser/deleted_on'"
+         info "removing $destuser@$desthost:$stripped_destdir/$userdir$deluser/"
+         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost mv "$stripped_destdir/$userdir$deluser/" "$stripped_destdir/deleted"
+         ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost "date +%c%n%s > '$stripped_destdir/deleted/$deluser/deleted_on'"
       done
    done
    rm $tmp1
@@ -145,8 +150,8 @@ function do_remove() {
 function do_rotate() {
    [ "$rotate" == "yes" ] || return;
    local user=$1
-   local userdir=${2%/}
-   local backuproot="$destdir/$userdir/$user"
+   local letter=${user:0:1}
+   local backuproot="$stripped_destdir/$letter/$user"
 (
    ssh -T -o PasswordAuthentication=no $desthost -l $destuser -i $destid_file $sshoptions <<EOF
 ##### BEGIN REMOTE SCRIPT #####
@@ -162,15 +167,13 @@ function do_rotate() {
       echo "Debug: skipping rotate of $user. $backuproot doesn't exist."
       exit
    fi
+
    for rottype in daily weekly monthly; do
       seconds=\$((seconds_\${rottype}))
 
       dir="$backuproot/\$rottype"
       if [ ! -d \$dir.1 ]; then
          echo "Debug: \$dir.1 does not exist, skipping."
-         continue 1
-      elif [ ! -f \$dir.1/created ]; then
-         echo "Warning: \$dir.1/created does not exist. This backup may be only partially completed. Skipping rotation."
          continue 1
       fi
 
@@ -199,7 +202,7 @@ function do_rotate() {
                echo "Debug: skipping rotation of \$dir.\$i because it was created" \$(( (now-created)/86400)) "days ago ("\$(( (now-cutoff_time)/86400))" needed)."
             fi
          fi
-      done
+      done     
    done
 
    max=\$((keepdaily+1))
@@ -243,13 +246,13 @@ EOF
 function setup_remote_dirs() {
    local user=$1
    local backuptype=$2
-   local userdir=${3%/}
-   local dir="$destdir/$userdir/$user/$backuptype"
-   local tmpdir="$destdir/$userdir/$user/rotate.tmp"
+   local letter=${user:0:1}
+   local dir="$stripped_destdir/$letter/$user/$backuptype"
+   local tmpdir="$stripped_destdir/$letter/$user/rotate.tmp"
 (
    ssh -T -o PasswordAuthentication=no $desthost -l $destuser -i $destid_file $sshoptions <<EOF
-      if [ ! -d $destdir ]; then
-         echo "Fatal: Destination directory $destdir does not exist on host $desthost."
+      if [ ! -d $stripped_destdir ]; then
+         echo "Fatal: Destination directory $stripped_destdir does not exist on host $desthost."
          exit 1
       elif [ -d $dir.1 ]; then
          if [ -f $dir.1/created ]; then
@@ -261,7 +264,7 @@ function setup_remote_dirs() {
          if [ -d $tmpdir ]; then
             mv $tmpdir $dir.1
             if [ \$? == 1 ]; then
-               echo "Fatal: could mv $destdir/rotate.tmp $dir.1 on host $desthost"
+               echo "Fatal: could not mv $stripped_destdir/rotate.tmp $dir.1 on host $desthost"
                exit 1
             fi
          else
@@ -289,21 +292,6 @@ EOF
    if [ $? == 1 ]; then exit; fi
 }
 
-function start_mux() {
-   if [ "$multiconnection" == "yes" ]; then
-      debug "Starting dummy ssh connection"
-      ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost sleep 1d &
-      sleep 1
-   fi
-}
-
-function end_mux() {
-   if [ "$multiconnection" == "yes" ]; then
-      debug "Stopping dummy ssh connection"
-      ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost pkill sleep
-   fi
-}
-
 ###
 ##################################################################
 
@@ -316,14 +304,10 @@ if [ ! $test ]; then
    fi
 fi
 
-end_mux
-start_mux
-
 ## SANITY CHECKS ##
-status=`ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost "[ -d \"$destdir\" ] && echo 'ok'"`
+status=`ssh -p $destport -i $destid_file $sshoptions $destuser@$desthost "[ -d \"$stripped_destdir\" ] && echo 'ok'"`
 if [ "$status" != "ok" ]; then
-   end_mux
-   fatal "Destination directory $destdir doesn't exist!"
+   fatal "Destination directory $stripped_destdir doesn't exist!"
    exit
 fi
 
@@ -342,26 +326,20 @@ if [ "$backup" == "yes" ]; then
    else fatal "keeping no backups"; fi
 
    if [ "$testuser" != "" ]; then
-      cd "$srcdir/${user:0:1}"
+      cd "$stripped_srcdir/${user:0:1}"
       do_rotate $testuser
       setup_remote_dirs $testuser $btype
       do_user $testuser $btype
    else
-      [ -d "$srcdir" ] || fatal "directory $srcdir not found."
-      cd "$srcdir"
-      for userdir in `ls -d1 */`; do
-         [ -d "$srcdir/$userdir" ] || fatal "directory $srcdir/$userdir not found."
-         cd "$srcdir/$userdir"
-         debug $userdir
-         for user in `ls -1`; do
-            [ "$user" != "" ] || continue
-            debug "$user $userdir"
-            do_rotate $user $userdir
-            setup_remote_dirs $user $btype $userdir
-            do_user $user $btype $userdir
-         done
+      [ -d "$stripped_srcdir" ] || fatal "directory $stripped_srcdir not found."
+      for user in `@DOVEADM@ user \* | cut -d@ -f1`
+      do
+         debug $user
+         [ "$user" != "" ] || continue
+         do_rotate $user
+         setup_remote_dirs $user $btype
+         do_user $user $btype
       done
    fi
 fi
 
-end_mux

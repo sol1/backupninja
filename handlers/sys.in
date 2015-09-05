@@ -25,14 +25,23 @@
 # (4) hardware information.
 #     write to a text file the important things which hwinfo can gleen.
 #
-# (5) the Luks header of every Luks block device, if option luksheaders
+# (5) the LUKS header of every LUKS block device, if option luksheaders
 #     is enabled.
-#     in case you (have to) scramble such a Luks header (for some time),
+#     in case you (have to) scramble such a LUKS header (for some time),
 #     and restore it later by running "dd if=luksheader.sda2.bin of=/dev/sda2"
 #     (MAKE SURE YOU PASS THE CORRECT DEVICE AS of= !!!)
 #
 # (6) LVM metadata for every detected volume group, if "lvm = yes"
 #
+# (7) a copy of each device's MBR, if "mbr = yes". A master boot record
+#     (MBR) is the 512-byte boot sector that is the first sector of a
+#     partitioned data storage device of a hard disk. To restore the MBR
+#     one could do something like: dd if=sda.mbr of=/dev/sda
+#     (MAKE SURE YOU PASS THE CORRECT DEVICE AS of= !!!)
+#     WARNING: Restoring the MBR with a mismatching partition table will
+#     make your data unreadable and nearly impossible to recover
+#
+# (8) a copy of the BIOS, if "bios = yes" and flashrom is installed
 
 if [ -f /etc/debian_version ]
 then
@@ -44,6 +53,11 @@ then
    os=redhat
    debug "Redhat detected"
    osversion="/etc/redhat-release"
+elif [ -f /etc/SuSE-release ]
+then
+   os=suse
+   debug "SuSE detected"
+   osversion="/etc/SuSE-release"
 else
    warning "Unknown OS detected!"
 fi
@@ -57,14 +71,14 @@ if [ ! -d $parentdir ]; then
    mkdir -p $parentdir
 fi
 
-if [ $os = "debian" ]
+if [ "$os" = "debian" ]
 then
    getconf packagesfile $parentdir/dpkg-selections.txt
    getconf packagemgr   `which dpkg`
    getconf packagemgroptions ' --get-selections *'
    getconf selectionsfile $parentdir/debconfsel.txt
    getconf debconfgetselections `which debconf-get-selections`
-elif [ $os = "redhat" ]
+elif [ "$os" = "redhat" ]
 then
    getconf packagesfile  $parentdir/rpmpackages.txt
    getconf packagemgr   `which rpm`
@@ -72,6 +86,11 @@ then
 
    getconf SYSREPORT `which sysreport`
    getconf sysreport_options ' -norpm '
+elif [ "$os" = "suse" ]
+then
+   getconf packagesfile  $parentdir/rpmpackages.txt
+   getconf packagemgr   `which rpm`
+   getconf packagemgroptions   ' -qa '
 else
    getconf packagesfile $parentdir/unknownOS.txt
 fi
@@ -100,6 +119,12 @@ getconf VGS `which vgs`
 getconf VGCFGBACKUP `which vgcfgbackup`
 getconf lvm no
 
+getconf mbr no
+getconf mbrfile $parentdir/mbr.__star__.bin
+
+getconf FLASHROM `which flashrom`
+getconf bios no
+
 getconf vsnames all
 
 # If vservers are configured, check that the ones listed in $vsnames are running.
@@ -119,11 +144,11 @@ fi
 
 if [ "$luksheaders" == "yes" ]; then
    if [ ! -x "$DD" ]; then
-      warning "can't find dd, skipping backup of Luks headers."
+      warning "can't find dd, skipping backup of LUKS headers."
       luksheaders="no"
    fi
    if [ ! -x "$CRYPTSETUP" ]; then
-      warning "can't find cryptsetup, skipping backup of Luks headers."
+      warning "can't find cryptsetup, skipping backup of LUKS headers."
       luksheaders="no"
    fi
 fi
@@ -136,6 +161,20 @@ if [ "$lvm" == "yes" ]; then
    if [ ! -x "$VGCFGBACKUP" ]; then
       warning "can't find vgcfgbackup, skipping backup of LVM metadata"
       lvm="no"
+   fi
+fi
+
+if [ "$mbr" == "yes" ]; then
+   if [ ! -x "$DD" ]; then
+      warning "can't find dd, skipping backup of MBR."
+      mbr="no"
+   fi
+fi
+
+if [ "$bios" == "yes" ]; then
+   if [ ! -x "$FLASHROM" ]; then
+      warning "can't find flashrom, skipping backup of BIOS."
+      mbr="no"
    fi
 fi
 
@@ -164,7 +203,7 @@ if [ "$packages" == "yes" ]; then
             # don't expand * since it can be used in $packagemgroptions
             set -o noglob
             debug "$VSERVER $vserver exec $packagemgr $packagemgroptions > $VROOTDIR/$vserver$packagesfile"
-       $VSERVER $vserver exec $packagemgr $packagemgroptions > $VROOTDIR/$vserver$packagesfile || fatal "can not save $packagemgr info to $packagesfile"
+            $VSERVER $vserver exec $packagemgr $packagemgroptions > $VROOTDIR/$vserver$packagesfile || fatal "can not save $packagemgr info to $packagesfile"
             set +o noglob
          fi
          # is $debconfgetselections available inside $vserver ?
@@ -232,7 +271,7 @@ catiffile () {
       echo $DASHES >> $sysreportfile
       for file in `find $1 -maxdepth 3 -noleaf -type f`
       do
-       catiffile $file
+         catiffile $file
       done
    fi
    echo $DASHES >> $sysreportfile
@@ -264,7 +303,7 @@ STATUS="Checking available memory:"
 catifexec "/usr/bin/free"
 
 STATUS="Checking free disk space:"
-catifexec "/bin/df" "-al"
+catifexec "/bin/df" "-al --exclude-type=tmpfs"
 
 STATUS="Collecting what services run at what run level:"
 if [ $os = "redhat" ]; then
@@ -348,13 +387,15 @@ echo "Getting information about the kernel."
 echo
 STATUS="Getting kernel version:"
 catifexec "/bin/uname" "-a"
-STATUS="Checking module information:"
-catifexec "/sbin/lsmod"
-for x  in $(/sbin/lsmod | /usr/bin/cut -f1 -d" " 2>/dev/null | /bin/grep -v Module 2>/dev/null
-) ; do
-   STATUS="Checking module information $x:"
-   catifexec "/sbin/modinfo" "$x"
-done
+if [ "$hardware" == "yes" ]; then
+   STATUS="Checking module information:"
+   catifexec "/sbin/lsmod"
+   for x  in $(/sbin/lsmod | /usr/bin/cut -f1 -d" " 2>/dev/null | /bin/grep -v Module 2>/dev/null
+   ) ; do
+      STATUS="Checking module information $x:"
+      catifexec "/sbin/modinfo" "$x"
+   done
+fi
 
 STATUS="Gathering information about your filesystems:"
 catiffile "/proc/filesystems"
@@ -432,9 +473,11 @@ catiffile "/proc/rtc"
 STATUS="Gathering information about your ide drivers:"
 catiffile "/proc/ide"
 
-STATUS="Gathering information about your bus:"
-catifexec "/usr/bin/lspci"
-catiffile "/proc/bus"
+if [ "$hardware" == "yes" ]; then
+   STATUS="Gathering information about your bus:"
+   catifexec "/usr/bin/lspci"
+   catiffile "/proc/bus"
+fi
 
 echo
 echo "Getting disk and filesystem information."
@@ -515,14 +558,14 @@ fi
 if [ "$partitions" == "yes" ]; then
    if [ "$dosfdisk" == "yes" ]; then
       if [ ! -x "$SFDISK" ]; then
-    warning "can't find sfdisk, skipping sfdisk report."
-    partitions="no"
+         warning "can't find sfdisk, skipping sfdisk report."
+         partitions="no"
       fi
    fi
    if [ "$dohwinfo" == "yes" ]; then
       if [ ! -x "$HWINFO" ]; then
-    warning "can't find hwinfo, skipping partition report."
-    partitions="no"
+         warning "can't find hwinfo, skipping partition report."
+         partitions="no"
       fi
    fi
 fi
@@ -544,15 +587,15 @@ fi
 if [ "$hardware" == "yes" ]; then
    if [ "$dohwinfo" == "yes" ]; then
       if [ -f $hardwarefile ]; then
-    rm $hardwarefile
+         rm $hardwarefile
       fi
       touch $hardwarefile
       echo -e "\n\n====================== summary ======================\n" >>  $hardwarefile
       debug "$HWINFO --short --cpu --network --disk --pci  >> $hardwarefile"
       $HWINFO --short --cpu --network --disk --pci  >> $hardwarefile
       for flag in cpu network bios pci; do
-    echo -e "\n\n====================== $flag ======================\n" >>  $hardwarefile
-    $HWINFO --$flag >> $hardwarefile
+         echo -e "\n\n====================== $flag ======================\n" >>  $hardwarefile
+         $HWINFO --$flag >> $hardwarefile
       done
    fi
 fi
@@ -565,21 +608,21 @@ fi
 if [ "$partitions" == "yes" ]; then
    if [ "$dosfdisk" == "yes" ]; then
       devices=`LC_ALL=C $SFDISK -l 2>/dev/null | grep "^Disk /dev" | @AWK@ '{print $2}' | cut -d: -f1`
-   if [ "$devices" == "" ]; then
-      warning "No harddisks found"
-   fi
-   for dev in $devices; do
-      debug "$SFDISK will try to backup partition tables for device $dev"
-      [ -b $dev ] || continue
-      label=${dev#/dev/}
-      label=${label//\//-}
-      outputfile=${partitionsfile//__star__/$label}
-      debug "$SFDISK $sfdisk_options -d $dev > $outputfile 2>/dev/null"
-      $SFDISK $sfdisk_options -d $dev > $outputfile 2>/dev/null
-      if [ $? -ne 0 ]; then
-         warning "The partition table for $dev could not be saved."
+      if [ "$devices" == "" ]; then
+         warning "No harddisks found"
       fi
-   done
+      for dev in $devices; do
+         debug "$SFDISK will try to backup partition tables for device $dev"
+         [ -b $dev ] || continue
+         label=${dev#/dev/}
+         label=${label//\//-}
+         outputfile=${partitionsfile//__star__/$label}
+         debug "$SFDISK $sfdisk_options -d $dev > $outputfile 2>/dev/null"
+         $SFDISK $sfdisk_options -d $dev > $outputfile 2>/dev/null
+         if [ $? -ne 0 ]; then
+            warning "The partition table for $dev could not be saved."
+         fi
+      done
    fi
    if [ "$dohwinfo" == "yes" ]; then
       debug "Using $HWINFO to get all available disk information"
@@ -591,8 +634,10 @@ fi
 if [ "$luksheaders" == "yes" ]; then
    devices=`LC_ALL=C $SFDISK -l 2>/dev/null | grep "^Disk /dev" | @AWK@ '{print $2}' | cut -d: -f1`
    [ -n "$devices" ] || warning "No block device found"
+   partitions=`LC_ALL=C $SFDISK -l 2>/dev/null |grep "^/dev" | @AWK@ '{print $1}'`
+   [ -n "$partitions" ] || warning "No partitions found"
    targetdevices=""
-   for dev in $devices; do
+   for dev in $devices $partitions; do
       [ -b $dev ] || continue
       debug "$CRYPTSETUP isLuks $dev"
       $CRYPTSETUP isLuks $dev
@@ -603,26 +648,45 @@ if [ "$luksheaders" == "yes" ]; then
       label=${label//\//-}
       outputfile=${luksheadersfile//__star__/$label}
       # the following sizes are expressed in terms of 512-byte sectors
-      debug "Let us find out the Luks header size for $dev"
+      debug "Let us find out the LUKS header size for $dev"
       debug "$CRYPTSETUP luksDump \"$dev\" | grep '^Payload offset:' | @AWK@ '{print $3}'"
       headersize=`$CRYPTSETUP luksDump "$dev" | grep '^Payload offset:' | @AWK@ '{print $3}'`
       if [ $? -ne 0 ]; then
-         warning "Could not compute the size of Luks header, skipping device $dev"
+         warning "Could not compute the size of LUKS header, skipping $dev"
          continue
-      elif [ -z "$headersize" -o -n "`echo \"$headersize\" | sed 's/[0-9]*//g'`" ]; then
-         warning "The computed size of Luks header is not an integer, skipping device $dev"
+      elif [ -z "$headersize" -o -n "`echo \"$headersize\" | @SED@ 's/[0-9]*//g'`" ]; then
+         warning "The computed size of LUKS header is not an integer, skipping $dev"
          continue
       fi
-      debug "Let us backup the Luks header of device $dev"
+      debug "Let us backup the LUKS header of $dev"
       debug "$DD if=\"${dev}\" of=\"${outputfile}\" bs=512 count=\"${headersize}\""
       output=`$DD if="${dev}" of="${outputfile}" bs=512 count="${headersize}" 2>&1`
       exit_code=$?
       if [ $exit_code -eq 0 ]; then
          debug $output
-         info "The Luks header of $dev was saved to $outputfile."
+         info "The LUKS header of $dev was saved to $outputfile."
       else
          debug $output
-         fatal "The Luks header of $dev could not be saved."
+         fatal "The LUKS header of $dev could not be saved."
+      fi
+   done
+fi
+
+if [ "$mbr" == "yes" ]; then
+   devices=`LC_ALL=C $SFDISK -l 2>/dev/null | grep "^Disk /dev" | @AWK@ '{print $2}' | cut -d: -f1`
+   if [ "$devices" == "" ]; then
+      warning "No harddisks found"
+   fi
+   for dev in $devices; do
+      debug "Will try to backup MBR tables for device $dev"
+      [ -b $dev ] || continue
+      label=${dev#/dev/}
+      label=${label//\//-}
+      outputfile=${mbrfile//__star__/$label}
+      debug "$DD if=$dev of=$outputfile bs=512 count=1 2>/dev/null"
+      $DD if=$dev of=$outputfile bs=512 count=1 2>/dev/null
+      if [ $? -ne 0 ]; then
+         warning "The MBR for $dev could not be saved."
       fi
    done
 fi
@@ -685,4 +749,15 @@ if [ "$lvm" == "yes" ]; then
          fatal "Unhandled error ($exit_code) while trying to backup LVM metadata, please report a bug"
          ;;
    esac
+fi
+
+## BIOS ####################################
+
+if [ "$bios" == "yes" ]; then
+   debug "Trying to backup BIOS"
+   debug "$FLASHROM -r ${parentdir}/bios --programmer internal >/dev/null 2>&1"
+   $FLASHROM -r ${parentdir}/bios --programmer internal >/dev/null 2>&1
+   if [ $? -ne 0 ]; then
+      warning "The BIOS could not be saved."
+   fi
 fi
