@@ -1,4 +1,14 @@
+### backupninja smbmount config file ###
+
+# Volume type of mountpoint. Only smb is supported currently.
+type = smb
+
+# Host for remote volumes
 host = 192.168.0.1
+
+# Share name
 share = data
+
+# Local mountpoint
 mountpoint = /var/backups/mount/data
 
